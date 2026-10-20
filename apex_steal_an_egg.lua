@@ -37,15 +37,17 @@ local CONFIG = {
 	PromptRange = 30,
 	AutoRange = 15,
 	ConfigFile = "apex_steal_an_egg.json",
-	Version = "1.1.0",
+	Version = "1.2.0",
 	SelfUrl = "https://raw.githubusercontent.com/worldcupi3/apex-hub/refs/heads/main/apex_steal_an_egg.lua",
 	Discord = "https://discord.gg/9KkKHQZdHF", -- never-expiring invite
 	-- ASSUMPTION: eggs store rarity as an attribute with this name (Common, Rare, Epic...).
 	-- If the game doesn't, eggs just show in yellow. Check the egg's Attributes in Dex.
 	RarityAttribute = "Rarity",
 	ESPRange = 0, -- player ESP max distance in studs, 0 = unlimited
+	AlarmRange = 40, -- Base Alarm radius around your Save Position spot
+	ClockTime = 14, -- Time of Day lock (0-24)
 }
-local NUM_KEYS = { "WalkSpeed", "JumpPower", "FlySpeed", "FOV", "Gravity", "PromptRange", "AutoRange", "ESPRange" }
+local NUM_KEYS = { "WalkSpeed", "JumpPower", "FlySpeed", "FOV", "Gravity", "PromptRange", "AutoRange", "ESPRange", "AlarmRange", "ClockTime" }
 
 local alive = true
 local connections = {}
@@ -900,6 +902,75 @@ action("Check for Updates", function()
 	checkUpdate(false)
 end)
 
+-- v1.2.0 extras ---------------------------------------------------------------
+
+-- base alarm: uses the spot from "Save Position" as your base
+local alarmTimer, alarmCooldown = 0, {}
+F.baseAlarm = feature("Base Alarm (uses Save Position)")
+bind(RunService.Heartbeat, function(dt)
+	if not F.baseAlarm.enabled then
+		return
+	end
+	alarmTimer += dt
+	if alarmTimer < 0.5 then
+		return
+	end
+	alarmTimer = 0
+	if not savedCF then
+		return
+	end
+	local now = os.clock()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local r = plr ~= lp and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if r and (r.Position - savedCF.Position).Magnitude <= CONFIG.AlarmRange and (alarmCooldown[plr] or 0) + 10 < now then
+			alarmCooldown[plr] = now
+			notify(plr.DisplayName .. " is near your saved spot")
+		end
+	end
+end)
+
+-- egg spawn alert
+local lastEggAlert = 0
+F.eggAlert = feature("Egg Spawn Alert")
+bind(workspace.DescendantAdded, function(inst)
+	if not F.eggAlert.enabled then
+		return
+	end
+	trackInstance(inst) -- idempotent, makes sure eggs[inst] is set regardless of signal order
+	if eggs[inst] and os.clock() - lastEggAlert > 1.5 then
+		lastEggAlert = os.clock()
+		notify("Egg spawned: " .. inst.Name)
+	end
+end)
+
+-- join / leave alerts
+F.joinAlerts = feature("Join / Leave Alerts")
+bind(Players.PlayerAdded, function(plr)
+	if F.joinAlerts.enabled then
+		notify(plr.DisplayName .. " joined")
+	end
+end)
+bind(Players.PlayerRemoving, function(plr)
+	if F.joinAlerts.enabled then
+		notify(plr.DisplayName .. " left")
+	end
+end)
+
+-- time of day lock
+local origClock
+F.timeLock = feature("Time of Day Lock", function()
+	origClock = Lighting.ClockTime
+end, function()
+	if origClock then
+		Lighting.ClockTime = origClock
+	end
+end)
+bind(RunService.Heartbeat, function()
+	if F.timeLock.enabled then
+		Lighting.ClockTime = CONFIG.ClockTime
+	end
+end)
+
 action("Copy Discord Invite", function()
 	if typeof(setclipboard) == "function" then
 		setclipboard(CONFIG.Discord)
@@ -1358,6 +1429,8 @@ toggleRow(F.promptEsp)
 toggleRow(F.arrow)
 toggleRow(F.noFog)
 toggleRow(F.hud)
+toggleRow(F.timeLock)
+stepperRow("Time of Day", "ClockTime", 1, 0, 24)
 
 header("PROMPTS AND EGGS")
 toggleRow(F.instant)
@@ -1370,6 +1443,10 @@ stepperRow("Auto Range", "AutoRange", 3, 5, 60)
 header("UTILITY")
 toggleRow(F.antiAfk)
 toggleRow(F.autoRejoin)
+toggleRow(F.baseAlarm)
+stepperRow("Alarm Range", "AlarmRange", 10, 10, 200)
+toggleRow(F.eggAlert)
+toggleRow(F.joinAlerts)
 
 header("ACTIONS")
 for _, a in ipairs(actions) do
