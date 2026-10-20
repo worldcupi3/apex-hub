@@ -37,8 +37,15 @@ local CONFIG = {
 	PromptRange = 30,
 	AutoRange = 15,
 	ConfigFile = "apex_steal_an_egg.json",
+	Version = "1.1.0",
+	SelfUrl = "https://raw.githubusercontent.com/worldcupi3/apex-hub/refs/heads/main/apex_steal_an_egg.lua",
+	Discord = "https://discord.gg/9KkKHQZdHF", -- never-expiring invite
+	-- ASSUMPTION: eggs store rarity as an attribute with this name (Common, Rare, Epic...).
+	-- If the game doesn't, eggs just show in yellow. Check the egg's Attributes in Dex.
+	RarityAttribute = "Rarity",
+	ESPRange = 0, -- player ESP max distance in studs, 0 = unlimited
 }
-local NUM_KEYS = { "WalkSpeed", "JumpPower", "FlySpeed", "FOV", "Gravity", "PromptRange", "AutoRange" }
+local NUM_KEYS = { "WalkSpeed", "JumpPower", "FlySpeed", "FOV", "Gravity", "PromptRange", "AutoRange", "ESPRange" }
 
 local alive = true
 local connections = {}
@@ -273,7 +280,11 @@ local function updatePlayerESP()
 		if plr ~= lp then
 			local char = plr.Character
 			local head = char and char:FindFirstChild("Head")
-			if char and head then
+			local inRange = true
+			if char and head and root and CONFIG.ESPRange > 0 then
+				inRange = (head.Position - root.Position).Magnitude <= CONFIG.ESPRange
+			end
+			if char and head and inRange then
 				local o = playerESP[plr]
 				if not o or o.char ~= char then
 					clearPlayerESP(plr)
@@ -289,6 +300,26 @@ local function updatePlayerESP()
 			end
 		end
 	end
+end
+
+local RARITY_COLORS = {
+	common = Color3.fromRGB(200, 200, 200),
+	uncommon = Color3.fromRGB(80, 200, 90),
+	rare = Color3.fromRGB(70, 130, 255),
+	epic = Color3.fromRGB(170, 80, 255),
+	legendary = Color3.fromRGB(255, 170, 0),
+	mythic = Color3.fromRGB(255, 60, 120),
+}
+
+local function rarityColor(inst)
+	local r = inst:GetAttribute(CONFIG.RarityAttribute)
+	if type(r) == "string" then
+		local c = RARITY_COLORS[r:lower()]
+		if c then
+			return c
+		end
+	end
+	return Color3.fromRGB(255, 220, 0)
 end
 
 local function updateEggESP()
@@ -311,8 +342,9 @@ local function updateEggESP()
 		if not o then
 			local part = inst:IsA("BasePart") and inst or inst:FindFirstChildWhichIsA("BasePart", true)
 			if part then
-				local h = makeHighlight(inst, Color3.fromRGB(255, 220, 0))
-				local gui, label = makeLabel(part, Color3.fromRGB(255, 220, 0))
+				local color = rarityColor(inst)
+				local h = makeHighlight(inst, color)
+				local gui, label = makeLabel(part, color)
 				o = { items = { h, gui }, label = label }
 				eggESP[inst] = o
 			end
@@ -626,6 +658,257 @@ end)
 local gui
 local steppers = {}
 
+-- extra features (v1.1.0) -----------------------------------------------------
+
+local function nearestPlayerRoot()
+	local root = getRoot()
+	if not root then
+		return nil
+	end
+	local best, bestDist = nil, math.huge
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local r = plr ~= lp and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if r then
+			local d = (r.Position - root.Position).Magnitude
+			if d < bestDist then
+				best, bestDist = r, d
+			end
+		end
+	end
+	return best
+end
+
+F.follow = feature("Follow Nearest Player")
+F.bhop = feature("Bunny Hop")
+
+-- prompt esp: labels every proximity prompt (nearest 25) through walls
+local promptESP = {}
+
+local function clearPromptESP(p)
+	local o = promptESP[p]
+	if o then
+		pcall(function()
+			o.gui:Destroy()
+		end)
+		promptESP[p] = nil
+	end
+end
+
+local function updatePromptESP()
+	local root = getRoot()
+	local list = {}
+	for p in pairs(prompts) do
+		if p.Parent and p.Enabled then
+			local pos = promptPosition(p)
+			if pos then
+				table.insert(list, { p = p, dist = root and (pos - root.Position).Magnitude or 0 })
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.dist < b.dist
+	end)
+	local keep = {}
+	for i = 1, math.min(25, #list) do
+		local p = list[i].p
+		keep[p] = true
+		local o = promptESP[p]
+		if not o then
+			local adornee = p.Parent:IsA("Attachment") and p.Parent.Parent or p.Parent
+			if adornee and adornee:IsA("BasePart") then
+				local g, label = makeLabel(adornee, Color3.fromRGB(120, 220, 255))
+				o = { gui = g, label = label }
+				promptESP[p] = o
+			end
+		end
+		if o then
+			local name = p.ActionText ~= "" and p.ActionText or p.Name
+			o.label.Text = name .. " [" .. math.floor(list[i].dist) .. "]"
+		end
+	end
+	for p in pairs(promptESP) do
+		if not keep[p] then
+			clearPromptESP(p)
+		end
+	end
+end
+
+F.promptEsp = feature("Prompt ESP", nil, function()
+	for p in pairs(promptESP) do
+		clearPromptESP(p)
+	end
+end)
+
+-- remove fog
+local fogOrig
+F.noFog = feature("Remove Fog", function()
+	fogOrig = { FogEnd = Lighting.FogEnd, FogStart = Lighting.FogStart, atmosphere = {} }
+	Lighting.FogStart = 0
+	Lighting.FogEnd = 1e6
+	for _, a in ipairs(Lighting:GetChildren()) do
+		if a:IsA("Atmosphere") then
+			fogOrig.atmosphere[a] = a.Density
+			a.Density = 0
+		end
+	end
+end, function()
+	if fogOrig then
+		Lighting.FogEnd = fogOrig.FogEnd
+		Lighting.FogStart = fogOrig.FogStart
+		for a, density in pairs(fogOrig.atmosphere) do
+			if a.Parent then
+				a.Density = density
+			end
+		end
+	end
+end)
+
+-- fps / ping counter
+local hudLabel
+local fpsAcc, fpsFrames = 0, 0
+F.hud = feature("FPS / Ping Counter", function()
+	hudLabel = Instance.new("TextLabel")
+	hudLabel.Size = UDim2.fromOffset(170, 22)
+	hudLabel.Position = UDim2.new(1, -180, 0, 6)
+	hudLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+	hudLabel.BackgroundTransparency = 0.3
+	hudLabel.BorderSizePixel = 0
+	hudLabel.TextColor3 = Color3.new(1, 1, 1)
+	hudLabel.Font = Enum.Font.GothamBold
+	hudLabel.TextSize = 13
+	hudLabel.Text = ""
+	hudLabel.Parent = gui
+end, function()
+	if hudLabel then
+		hudLabel:Destroy()
+		hudLabel = nil
+	end
+end)
+bind(RunService.RenderStepped, function(dt)
+	if hudLabel then
+		fpsAcc += dt
+		fpsFrames += 1
+		if fpsAcc >= 0.5 then
+			local ping = math.floor(lp:GetNetworkPing() * 1000)
+			hudLabel.Text = ("FPS %d | Ping %dms"):format(math.floor(fpsFrames / fpsAcc), ping)
+			fpsAcc, fpsFrames = 0, 0
+		end
+	end
+end)
+
+-- arrow pointing at the nearest egg
+local arrowLabel
+F.arrow = feature("Arrow to Nearest Egg", function()
+	arrowLabel = Instance.new("TextLabel")
+	arrowLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+	arrowLabel.Size = UDim2.fromOffset(32, 32)
+	arrowLabel.BackgroundTransparency = 1
+	arrowLabel.Text = "▲"
+	arrowLabel.TextSize = 28
+	arrowLabel.Font = Enum.Font.GothamBold
+	arrowLabel.TextColor3 = Color3.fromRGB(255, 220, 0)
+	arrowLabel.TextStrokeTransparency = 0
+	arrowLabel.Visible = false
+	arrowLabel.Parent = gui
+end, function()
+	if arrowLabel then
+		arrowLabel:Destroy()
+		arrowLabel = nil
+	end
+end)
+bind(RunService.RenderStepped, function()
+	if not arrowLabel then
+		return
+	end
+	local cam = workspace.CurrentCamera
+	local egg = nearestEgg()
+	if not egg or not cam then
+		arrowLabel.Visible = false
+		return
+	end
+	local v = cam:WorldToViewportPoint(eggPosition(egg))
+	local center = cam.ViewportSize / 2
+	local dir = Vector2.new(v.X, v.Y) - center
+	if v.Z < 0 then
+		dir = -dir
+	end
+	if dir.Magnitude < 1 then
+		dir = Vector2.new(0, -1)
+	end
+	local unit = dir.Unit
+	local p = center + unit * math.min(dir.Magnitude, 180)
+	arrowLabel.Visible = true
+	arrowLabel.Position = UDim2.fromOffset(p.X, p.Y)
+	arrowLabel.Rotation = math.deg(math.atan2(unit.Y, unit.X)) + 90
+end)
+
+-- spectate
+local spectateIndex = 0
+
+local function stopSpectate()
+	local cam, hum = workspace.CurrentCamera, getHum()
+	if cam and hum then
+		cam.CameraSubject = hum
+	end
+end
+
+local function spectatePlayer(plr)
+	local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		workspace.CurrentCamera.CameraSubject = hum
+		notify("Spectating " .. plr.DisplayName)
+	else
+		notify("That player has no character right now")
+	end
+end
+
+action("Spectate Next Player", function()
+	local others = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= lp then
+			table.insert(others, plr)
+		end
+	end
+	if #others == 0 then
+		notify("No other players")
+		return
+	end
+	spectateIndex = spectateIndex % #others + 1
+	spectatePlayer(others[spectateIndex])
+end)
+action("Stop Spectating", stopSpectate)
+
+-- update checker
+local function checkUpdate(silent)
+	task.spawn(function()
+		local ok, src = pcall(game.HttpGet, game, CONFIG.SelfUrl)
+		if not ok or type(src) ~= "string" then
+			if not silent then
+				notify("Update check failed")
+			end
+			return
+		end
+		local remote = src:match('Version = "([%d%.]+)"')
+		if remote and remote ~= CONFIG.Version then
+			notify("Update available: v" .. remote .. " (you have v" .. CONFIG.Version .. ")")
+		elseif not silent then
+			notify("You're on the latest version (v" .. CONFIG.Version .. ")")
+		end
+	end)
+end
+action("Check for Updates", function()
+	checkUpdate(false)
+end)
+
+action("Copy Discord Invite", function()
+	if typeof(setclipboard) == "function" then
+		setclipboard(CONFIG.Discord)
+		notify("Discord invite copied")
+	else
+		notify(CONFIG.Discord)
+	end
+end)
+
 local function unload()
 	alive = false
 	for _, f in ipairs(features) do
@@ -664,9 +947,11 @@ local function saveConfig()
 	notify("Config saved")
 end
 
-local function loadConfig()
+local function loadConfig(silent)
 	if typeof(isfile) ~= "function" or typeof(readfile) ~= "function" or not isfile(CONFIG.ConfigFile) then
-		notify("No saved config found")
+		if not silent then
+			notify("No saved config found")
+		end
 		return
 	end
 	local ok, data = pcall(function()
@@ -690,7 +975,9 @@ local function loadConfig()
 			setFeature(f, value == true)
 		end
 	end
-	notify("Config loaded")
+	if not silent then
+		notify("Config loaded")
+	end
 end
 
 action("Save Config", saveConfig)
@@ -719,6 +1006,15 @@ bind(RunService.Heartbeat, function(dt)
 	end
 	if F.hideTag.enabled then
 		hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	end
+	if F.follow.enabled then
+		local target = nearestPlayerRoot()
+		if target then
+			hum:MoveTo(target.Position)
+		end
+	end
+	if F.bhop.enabled and hum.FloorMaterial ~= Enum.Material.Air and hum.MoveDirection.Magnitude > 0 then
+		hum.Jump = true
 	end
 	if F.antiRag.enabled and hum ~= antiRagHum then
 		hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
@@ -776,6 +1072,9 @@ bind(RunService.Heartbeat, function(dt)
 		end
 		if F.eggEsp.enabled then
 			updateEggESP()
+		end
+		if F.promptEsp.enabled then
+			updatePromptESP()
 		end
 	end
 
@@ -873,6 +1172,7 @@ end)
 gui = Instance.new("ScreenGui")
 gui.Name = "ApexHub"
 gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
 local parented = pcall(function()
 	gui.Parent = (typeof(gethui) == "function" and gethui()) or CoreGui
 end)
@@ -937,6 +1237,7 @@ do
 	end)
 end
 
+local accentLabels = {}
 local function header(text)
 	local l = Instance.new("TextLabel")
 	l.Size = UDim2.new(1, -16, 0, 20)
@@ -947,6 +1248,7 @@ local function header(text)
 	l.TextXAlignment = Enum.TextXAlignment.Left
 	l.Text = text
 	l.Parent = scroll
+	table.insert(accentLabels, l)
 end
 
 local function styleButton(b)
@@ -1037,11 +1339,14 @@ toggleRow(F.noclip)
 toggleRow(F.clickTp)
 toggleRow(F.antiVoid)
 toggleRow(F.antiRag)
+toggleRow(F.follow)
+toggleRow(F.bhop)
 
 header("VISUALS")
 toggleRow(F.playerEsp)
 toggleRow(F.eggEsp)
 toggleRow(F.tracers)
+stepperRow("ESP Range (0 = any)", "ESPRange", 100, 0, 3000)
 toggleRow(F.fullbright)
 toggleRow(F.fov)
 stepperRow("FOV", "FOV", 5, 40, 120)
@@ -1049,6 +1354,10 @@ toggleRow(F.gravity)
 stepperRow("Gravity", "Gravity", 20, 0, 400)
 toggleRow(F.zoom)
 toggleRow(F.hideTag)
+toggleRow(F.promptEsp)
+toggleRow(F.arrow)
+toggleRow(F.noFog)
+toggleRow(F.hud)
 
 header("PROMPTS AND EGGS")
 toggleRow(F.instant)
@@ -1080,6 +1389,7 @@ end)
 header("ZONES")
 
 local zoneButtons = {}
+local zoneBox
 
 local function zoneMatches(inst)
 	local name = inst.Name:lower()
@@ -1133,7 +1443,6 @@ local function scanZones()
 		styleButton(b)
 		b.BackgroundColor3 = Color3.fromRGB(70, 60, 40)
 		b.Text = "TP: " .. zone.Name
-		b.LayoutOrder = 1000 + i
 		bind(b.MouseButton1Click, function()
 			local root = getRoot()
 			local pos = zone.Parent and zonePosition(zone)
@@ -1143,7 +1452,8 @@ local function scanZones()
 				notify("That zone is gone, rescan")
 			end
 		end)
-		b.Parent = scroll
+		b.Size = UDim2.new(1, 0, 0, 26)
+		b.Parent = zoneBox
 		table.insert(zoneButtons, b)
 	end
 	notify(#found .. " zone(s) found")
@@ -1156,11 +1466,170 @@ scanBtn.Text = "Scan Zones"
 bind(scanBtn.MouseButton1Click, scanZones)
 scanBtn.Parent = scroll
 
--- keep rows in build order (zone buttons use LayoutOrder 1000+)
+local function makeBox()
+	local box = Instance.new("Frame")
+	box.Size = UDim2.new(1, -16, 0, 0)
+	box.AutomaticSize = Enum.AutomaticSize.Y
+	box.BackgroundTransparency = 1
+	local l = Instance.new("UIListLayout", box)
+	l.Padding = UDim.new(0, 4)
+	box.Parent = scroll
+	return box
+end
+
+local function smallButton(text, color, parent, fn)
+	local b = Instance.new("TextButton")
+	styleButton(b)
+	b.Size = UDim2.new(1, 0, 0, 26)
+	b.BackgroundColor3 = color
+	b.Text = text
+	bind(b.MouseButton1Click, fn)
+	b.Parent = parent
+	return b
+end
+
+zoneBox = makeBox()
+
+-- waypoints: save your current spot, get a teleport button for it -------------
+
+header("WAYPOINTS")
+local wpBox
+local wpCount = 0
+smallButton("Save Waypoint Here", Color3.fromRGB(60, 60, 110), scroll, function()
+	local root = getRoot()
+	if not root then
+		return
+	end
+	wpCount += 1
+	local cf = root.CFrame
+	local n = wpCount
+	smallButton("TP: Waypoint " .. n, Color3.fromRGB(40, 90, 90), wpBox, function()
+		local r = getRoot()
+		if r then
+			r.CFrame = cf
+		end
+	end)
+	notify("Waypoint " .. n .. " saved")
+end)
+smallButton("Clear Waypoints", Color3.fromRGB(110, 50, 50), scroll, function()
+	for _, c in ipairs(wpBox:GetChildren()) do
+		if c:IsA("TextButton") then
+			c:Destroy()
+		end
+	end
+	wpCount = 0
+end)
+wpBox = makeBox()
+
+-- player list: tp and spectate per player -------------------------------------
+
+header("PLAYERS")
+local playerBox
+smallButton("Refresh Player List", Color3.fromRGB(60, 60, 110), scroll, function()
+	for _, c in ipairs(playerBox:GetChildren()) do
+		if c:IsA("TextButton") then
+			c:Destroy()
+		end
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= lp then
+			smallButton("TP: " .. plr.DisplayName, Color3.fromRGB(70, 60, 40), playerBox, function()
+				local root = getRoot()
+				local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+				if root and r then
+					root.CFrame = r.CFrame * CFrame.new(0, 0, 4)
+				end
+			end)
+			smallButton("Spectate: " .. plr.DisplayName, Color3.fromRGB(50, 70, 50), playerBox, function()
+				spectatePlayer(plr)
+			end)
+		end
+	end
+end)
+playerBox = makeBox()
+
+-- themes and minimize ---------------------------------------------------------
+
+local THEMES = {
+	Color3.fromRGB(255, 170, 0),
+	Color3.fromRGB(80, 160, 255),
+	Color3.fromRGB(80, 210, 120),
+	Color3.fromRGB(255, 90, 160),
+}
+local themeIndex = 1
+header("MENU")
+smallButton("Cycle Theme", Color3.fromRGB(60, 60, 110), scroll, function()
+	themeIndex = themeIndex % #THEMES + 1
+	title.BackgroundColor3 = THEMES[themeIndex]
+	for _, l in ipairs(accentLabels) do
+		l.TextColor3 = THEMES[themeIndex]
+	end
+end)
+
+do
+	local minBtn = Instance.new("TextButton")
+	minBtn.Size = UDim2.fromOffset(28, 26)
+	minBtn.Position = UDim2.new(1, -32, 0, 2)
+	minBtn.BackgroundTransparency = 1
+	minBtn.Font = Enum.Font.GothamBold
+	minBtn.TextSize = 18
+	minBtn.TextColor3 = Color3.fromRGB(20, 20, 26)
+	minBtn.Text = "-"
+	minBtn.Parent = title
+	local minimized = false
+	bind(minBtn.MouseButton1Click, function()
+		minimized = not minimized
+		scroll.Visible = not minimized
+		main.Size = minimized and UDim2.fromOffset(290, 30) or UDim2.fromOffset(290, 420)
+		minBtn.Text = minimized and "+" or "-"
+	end)
+end
+
+-- mobile: floating button to show/hide the menu
+if UserInputService.TouchEnabled then
+	local toggle = Instance.new("TextButton")
+	toggle.Size = UDim2.fromOffset(46, 46)
+	toggle.Position = UDim2.new(1, -56, 0.5, -23)
+	toggle.BackgroundColor3 = Color3.fromRGB(255, 170, 0)
+	toggle.BorderSizePixel = 0
+	toggle.Font = Enum.Font.GothamBold
+	toggle.TextSize = 13
+	toggle.TextColor3 = Color3.fromRGB(20, 20, 26)
+	toggle.Text = "Apex"
+	Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+	toggle.Parent = gui
+	bind(toggle.MouseButton1Click, function()
+		main.Visible = not main.Visible
+	end)
+end
+
+-- keep rows in build order
 for i, child in ipairs(scroll:GetChildren()) do
 	if child:IsA("GuiObject") then
 		child.LayoutOrder = i
 	end
 end
 
-notify("Apex Hub loaded | RightShift hides the menu")
+-- fly speed hotkeys: ] faster, [ slower
+bind(UserInputService.InputBegan, function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.RightBracket then
+		CONFIG.FlySpeed = math.clamp(CONFIG.FlySpeed + 10, 20, 300)
+	elseif input.KeyCode == Enum.KeyCode.LeftBracket then
+		CONFIG.FlySpeed = math.clamp(CONFIG.FlySpeed - 10, 20, 300)
+	else
+		return
+	end
+	for _, refresh in ipairs(steppers) do
+		refresh()
+	end
+	notify("Fly speed: " .. CONFIG.FlySpeed)
+end)
+
+-- startup: restore saved config, then check for a newer version
+loadConfig(true)
+checkUpdate(true)
+
+notify("Apex Hub v" .. CONFIG.Version .. " loaded | RightShift hides the menu")
